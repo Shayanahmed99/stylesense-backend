@@ -1,14 +1,10 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import mediapipe as mp
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision
 import cv2
 import numpy as np
 from PIL import Image
 import io
-import urllib.request
-import os
 
 app = FastAPI(title="StyleSense Analysis Service")
 
@@ -19,14 +15,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Download pose landmarker model if not present
-MODEL_PATH = "pose_landmarker.task"
-MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
-
-if not os.path.exists(MODEL_PATH):
-    print("Downloading pose landmarker model...")
-    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-    print("Model downloaded.")
+mp_pose = mp.solutions.pose
 
 MONK_TONES = [
     {"label": "Monk 1",  "min_l": 85},
@@ -56,13 +45,11 @@ SKIN_TONE_PALETTES = {
 
 
 def classify_body_shape(landmarks) -> str:
-    lm = landmarks
-
+    lm = landmarks.landmark
     shoulder_width = abs(lm[11].x - lm[12].x)
     hip_width      = abs(lm[23].x - lm[24].x)
     waist_width    = (shoulder_width + hip_width) / 2 * 0.75
-
-    ratio_sw_hw = shoulder_width / hip_width if hip_width > 0 else 1
+    ratio_sw_hw    = shoulder_width / hip_width if hip_width > 0 else 1
 
     if 0.9 <= ratio_sw_hw <= 1.1 and waist_width < shoulder_width * 0.85:
         return "Hourglass"
@@ -110,24 +97,16 @@ async def analyze_selfie(file: UploadFile = File(...)):
     image_pil = Image.open(io.BytesIO(contents)).convert("RGB")
     image_np  = np.array(image_pil)
 
-    # Use new MediaPipe Tasks API
-    base_options    = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
-    options         = vision.PoseLandmarkerOptions(
-        base_options=base_options,
-        output_segmentation_masks=False
-    )
-    detector        = vision.PoseLandmarker.create_from_options(options)
-    mp_image        = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_np)
-    detection_result = detector.detect(mp_image)
+    with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
+        results = pose.process(image_np)
 
-    if not detection_result.pose_landmarks:
+    if not results.pose_landmarks:
         raise HTTPException(
             status_code=422,
             detail="Could not detect a person in the image. Please upload a clear full-body front-facing photo."
         )
 
-    landmarks  = detection_result.pose_landmarks[0]
-    body_shape = classify_body_shape(landmarks)
+    body_shape         = classify_body_shape(results.pose_landmarks)
     skin_tone, palette = classify_skin_tone(image_np)
 
     return {
