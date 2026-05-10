@@ -29,28 +29,85 @@ const buildPrompt = (bodyShape, skinTone, styleCategory, occasion, colorPalette)
   );
 };
 
-// Calls HuggingFace Stable Diffusion and uploads result to Cloudinary
-const generateSingleImage = async (prompt, index) => {
-  const response = await axios.post(
-    'https://api-inference.huggingface.co/models/runwayml/stable-diffusion-v1-5',
-    { inputs: prompt },
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      responseType: 'arraybuffer',
-      timeout: 60000,
-    }
-  );
-
-  // Check if HuggingFace returned an error JSON instead of image bytes
-  const contentType = response.headers['content-type'] || '';
-  if (contentType.includes('application/json')) {
-    const errorText = Buffer.from(response.data).toString('utf8');
-    console.error('HuggingFace returned JSON instead of image:', errorText);
-    throw new Error(`HuggingFace error: ${errorText}`);
+// Pings the HuggingFace model to warm it up before generation
+const warmUpModel = async () => {
+  try {
+    await axios.post(
+      'https://api-inference.huggingface.co/models/runwayml/stable-diffusion-v1-5',
+      { inputs: 'warmup' },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 10000,
+        validateStatus: () => true, // don't throw on any status
+      }
+    );
+  } catch (_) {
+    // Ignore — just warming up
   }
+};
+
+// Calls HuggingFace Stable Diffusion with retry on 503 (model loading)
+const callHuggingFace = async (prompt, retries = 4) => {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const response = await axios.post(
+      'https://api-inference.huggingface.co/models/runwayml/stable-diffusion-v1-5',
+      { inputs: prompt },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        responseType: 'arraybuffer',
+        timeout: 120000,
+        validateStatus: () => true, // handle all statuses manually
+      }
+    );
+
+    // 503 means model is still loading — wait and retry
+    if (response.status === 503) {
+      let waitMs = 30000; // default 30s
+      try {
+        const json = JSON.parse(Buffer.from(response.data).toString('utf8'));
+        if (json.estimated_time) waitMs = Math.ceil(json.estimated_time) * 1000;
+        console.log(`HuggingFace model loading, estimated wait: ${json.estimated_time}s (attempt ${attempt}/${retries})`);
+      } catch (_) {}
+
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, waitMs));
+        continue;
+      } else {
+        throw new Error('Model still loading after all retries. Please try again in a minute.');
+      }
+    }
+
+    // Any other non-2xx status
+    if (response.status !== 200) {
+      let errorMsg = `HuggingFace returned status ${response.status}`;
+      try {
+        const json = JSON.parse(Buffer.from(response.data).toString('utf8'));
+        errorMsg += `: ${json.error || JSON.stringify(json)}`;
+      } catch (_) {}
+      throw new Error(errorMsg);
+    }
+
+    // Check if response is JSON instead of image bytes (unexpected error response)
+    const contentType = response.headers['content-type'] || '';
+    if (contentType.includes('application/json')) {
+      const errorText = Buffer.from(response.data).toString('utf8');
+      console.error('HuggingFace returned JSON instead of image:', errorText);
+      throw new Error(`HuggingFace error: ${errorText}`);
+    }
+
+    return response; // success — return the full response
+  }
+};
+
+// Calls HuggingFace and uploads result image to Cloudinary
+const generateSingleImage = async (prompt, index) => {
+  const response = await callHuggingFace(prompt);
 
   const uploadResult = await new Promise((resolve, reject) => {
     cloudinary.uploader.upload_stream(
@@ -86,7 +143,13 @@ const generateOutfits = async (req, res) => {
     const finalPalette  = getCategoryColors(styleCategory, skinTone, colorPalette);
     const prompt        = buildPrompt(bodyShape, skinTone, styleCategory, inputText, finalPalette);
 
-    // Generate 3 outfit images in parallel
+    // Fire warmup ping immediately (non-blocking) while we do DB work
+    const warmupPromise = warmUpModel();
+
+    // Await warmup before starting generation
+    await warmupPromise;
+
+    // Generate 3 outfit images sequentially to avoid hammering the free-tier rate limit
     const imageUrls = [];
     imageUrls.push(await generateSingleImage(prompt, 1));
     imageUrls.push(await generateSingleImage(prompt, 2));
@@ -105,17 +168,26 @@ const generateOutfits = async (req, res) => {
     });
 
     res.status(201).json({
-      outfitId: outfit._id,
-      images:   outfit.images,
+      outfitId:     outfit._id,
+      images:       outfit.images,
       styleCategory,
       colorPalette: finalPalette,
     });
   } catch (error) {
+    console.error('generateOutfits error:', error.message);
+
+    if (error.message && error.message.includes('still loading')) {
+      return res.status(503).json({
+        message: 'The AI model is loading, please try again in 30 seconds',
+      });
+    }
+
     if (error.response && error.response.status === 503) {
       return res.status(503).json({
         message: 'The AI model is loading, please try again in 30 seconds',
       });
     }
+
     res.status(500).json({ message: 'Outfit generation failed', error: error.message });
   }
 };
