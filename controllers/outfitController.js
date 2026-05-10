@@ -4,6 +4,9 @@ const Outfit = require('../models/Outfit');
 const User = require('../models/User');
 const { classifyMood, getCategoryColors } = require('./moodController');
 
+// Helper to wait
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 // Maps body shape to a silhouette description for the prompt
 const getsilhouetteHint = (bodyShape) => {
   const hints = {
@@ -29,10 +32,10 @@ const buildPrompt = (bodyShape, skinTone, styleCategory, occasion, colorPalette)
   );
 };
 
-// Calls Pollinations AI (free, no API key needed) and uploads to Cloudinary
+// Calls Pollinations AI and uploads to Cloudinary
 const generateSingleImage = async (prompt, index) => {
-  const encodedPrompt = encodeURIComponent(prompt);
-  const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=512&height=768&nologo=true&seed=${Date.now() + index}`;
+  const encodedPrompt = encodeURIComponent(`${prompt}, style variant ${index}`);
+  const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=512&height=768&nologo=true&seed=${Date.now() + index * 1000}`;
 
   console.log(`Generating image ${index} from Pollinations...`);
 
@@ -80,10 +83,12 @@ const generateOutfits = async (req, res) => {
 
     console.log('Generating outfits with prompt:', prompt);
 
-    // Generate 3 images sequentially
+    // Generate 3 images sequentially with delay to avoid rate limiting
     const imageUrls = [];
     imageUrls.push(await generateSingleImage(prompt, 1));
+    await sleep(3000);
     imageUrls.push(await generateSingleImage(prompt, 2));
+    await sleep(3000);
     imageUrls.push(await generateSingleImage(prompt, 3));
 
     // Save to database
