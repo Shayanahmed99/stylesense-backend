@@ -8,7 +8,13 @@ connectDB();
 
 const app = express();
 
-app.use(cors());
+app.use(cors({
+  origin: [
+    'http://localhost:8080',
+    'http://localhost:5173',
+    'https://stylesense-bds.lovable.app/'
+  ]
+}));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
