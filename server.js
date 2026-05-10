@@ -12,7 +12,8 @@ app.use(cors({
   origin: [
     'http://localhost:8080',
     'http://localhost:5173',
-    'https://stylesense-bds.lovable.app'
+    'https://stylesense-bds.lovable.app',
+    'https://b5faf7b5-1251-4aec-a00a-929b356edd49.lovableproject.com'
   ],
   credentials: true
 }));
