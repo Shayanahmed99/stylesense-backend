@@ -1,10 +1,14 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
 import cv2
 import numpy as np
 from PIL import Image
 import io
+import urllib.request
+import os
 
 app = FastAPI(title="StyleSense Analysis Service")
 
@@ -15,23 +19,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-mp_pose = mp.solutions.pose
+# Download pose landmarker model if not present
+MODEL_PATH = "pose_landmarker.task"
+MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
 
-# Monk Skin Tone scale — 10 tones mapped to approximate LAB lightness ranges
+if not os.path.exists(MODEL_PATH):
+    print("Downloading pose landmarker model...")
+    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    print("Model downloaded.")
+
 MONK_TONES = [
-    {"label": "Monk 1",  "hex": "#f6ede4", "min_l": 85},
-    {"label": "Monk 2",  "hex": "#f3e7db", "min_l": 80},
-    {"label": "Monk 3",  "hex": "#f7ead0", "min_l": 75},
-    {"label": "Monk 4",  "hex": "#eadaba", "min_l": 68},
-    {"label": "Monk 5",  "hex": "#d7bd96", "min_l": 60},
-    {"label": "Monk 6",  "hex": "#a07850", "min_l": 50},
-    {"label": "Monk 7",  "hex": "#825c43", "min_l": 42},
-    {"label": "Monk 8",  "hex": "#604134", "min_l": 34},
-    {"label": "Monk 9",  "hex": "#3a312a", "min_l": 26},
-    {"label": "Monk 10", "hex": "#292420", "min_l": 0},
+    {"label": "Monk 1",  "min_l": 85},
+    {"label": "Monk 2",  "min_l": 80},
+    {"label": "Monk 3",  "min_l": 75},
+    {"label": "Monk 4",  "min_l": 68},
+    {"label": "Monk 5",  "min_l": 60},
+    {"label": "Monk 6",  "min_l": 50},
+    {"label": "Monk 7",  "min_l": 42},
+    {"label": "Monk 8",  "min_l": 34},
+    {"label": "Monk 9",  "min_l": 26},
+    {"label": "Monk 10", "min_l": 0},
 ]
 
-# Color palettes recommended per Monk tone
 SKIN_TONE_PALETTES = {
     "Monk 1":  ["#F5F5DC", "#FFE4B5", "#98FB98", "#87CEEB", "#DDA0DD"],
     "Monk 2":  ["#FFFACD", "#F0E68C", "#90EE90", "#ADD8E6", "#FFB6C1"],
@@ -47,18 +56,10 @@ SKIN_TONE_PALETTES = {
 
 
 def classify_body_shape(landmarks) -> str:
-    """
-    Classifies body shape based on shoulder, waist, and hip landmark ratios.
-    Uses MediaPipe pose landmark indices:
-      11, 12 = left/right shoulder
-      23, 24 = left/right hip
-      25, 26 = left/right knee (used as waist proxy)
-    """
-    lm = landmarks.landmark
+    lm = landmarks
 
     shoulder_width = abs(lm[11].x - lm[12].x)
     hip_width      = abs(lm[23].x - lm[24].x)
-    # Approximate waist as midpoint between shoulder and hip width
     waist_width    = (shoulder_width + hip_width) / 2 * 0.75
 
     ratio_sw_hw = shoulder_width / hip_width if hip_width > 0 else 1
@@ -75,20 +76,15 @@ def classify_body_shape(landmarks) -> str:
         return "Rectangle"
 
 
-def classify_skin_tone(image_rgb: np.ndarray) -> tuple[str, list[str]]:
-    """
-    Detects skin tone from the upper-center region of the image (face/neck area).
-    Converts to LAB color space and compares lightness against Monk scale thresholds.
-    """
+def classify_skin_tone(image_rgb: np.ndarray):
     h, w = image_rgb.shape[:2]
-    # Crop face region — upper 30% center 40% of the image
     face_region = image_rgb[0:int(h * 0.3), int(w * 0.3):int(w * 0.7)]
 
     if face_region.size == 0:
         return "Monk 4", SKIN_TONE_PALETTES["Monk 4"]
 
-    lab      = cv2.cvtColor(face_region, cv2.COLOR_RGB2LAB)
-    avg_l    = float(np.mean(lab[:, :, 0])) / 255 * 100  # Normalize to 0-100
+    lab   = cv2.cvtColor(face_region, cv2.COLOR_RGB2LAB)
+    avg_l = float(np.mean(lab[:, :, 0])) / 255 * 100
 
     tone_label = "Monk 10"
     for tone in MONK_TONES:
@@ -107,27 +103,32 @@ def health_check():
 
 @app.post("/analyze")
 async def analyze_selfie(file: UploadFile = File(...)):
-    # Validate file type
     if file.content_type not in ["image/jpeg", "image/jpg", "image/png"]:
         raise HTTPException(status_code=400, detail="Only JPEG and PNG images are accepted")
 
-    contents = await file.read()
+    contents  = await file.read()
     image_pil = Image.open(io.BytesIO(contents)).convert("RGB")
     image_np  = np.array(image_pil)
-    image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
 
-    # Run MediaPipe Pose
-    with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
-        results = pose.process(image_np)
+    # Use new MediaPipe Tasks API
+    base_options    = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+    options         = vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        output_segmentation_masks=False
+    )
+    detector        = vision.PoseLandmarker.create_from_options(options)
+    mp_image        = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_np)
+    detection_result = detector.detect(mp_image)
 
-    if not results.pose_landmarks:
+    if not detection_result.pose_landmarks:
         raise HTTPException(
             status_code=422,
             detail="Could not detect a person in the image. Please upload a clear full-body front-facing photo."
         )
 
-    body_shape           = classify_body_shape(results.pose_landmarks)
-    skin_tone, palette   = classify_skin_tone(image_np)
+    landmarks  = detection_result.pose_landmarks[0]
+    body_shape = classify_body_shape(landmarks)
+    skin_tone, palette = classify_skin_tone(image_np)
 
     return {
         "bodyShape":    body_shape,
